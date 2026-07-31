@@ -94,7 +94,8 @@ env \
   --swap-max 2G \
   --min-available 5G \
   --cmake-build "$build_dir" \
-  --target test_sunshine sunshine
+  --target test_sunshine \
+  --target sunshine
 
 "$build_dir/tests/test_sunshine" \
   --gtest_filter='LinuxInputCapabilitiesTest.*'
