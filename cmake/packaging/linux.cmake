@@ -43,6 +43,8 @@ endif()
 
 # RPM specific
 set(CPACK_RPM_PACKAGE_LICENSE "GPLv3")
+set(CPACK_RPM_PACKAGE_NAME "${CMAKE_PROJECT_NAME}")
+set(CPACK_RPM_PACKAGE_RELEASE "1.kkkzbh")
 
 # FreeBSD specific
 set(CPACK_FREEBSD_PACKAGE_MAINTAINER "${CPACK_PACKAGE_VENDOR}")
@@ -151,7 +153,8 @@ if(${SUNSHINE_TRAY} STREQUAL 1)
     # Icons used by the Qt tray backend are no longer installed to the hicolor icon theme,
     # because Qt6 will not allow icons not part of the theme... so we will use icons from our web directory instead
 
-    if(TRAY_QT_VERSION EQUAL 6)
+    get_target_property(SUNSHINE_TRAY_LINK_LIBRARIES tray LINK_LIBRARIES)
+    if("Qt6::Widgets" IN_LIST SUNSHINE_TRAY_LINK_LIBRARIES)
         set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
                     ${CPACK_DEBIAN_PACKAGE_DEPENDS}, \
                     libqt6widgets6, \
@@ -166,7 +169,7 @@ if(${SUNSHINE_TRAY} STREQUAL 1)
                 devel/qt6-base
                 graphics/qt6-svg
         )
-    else()
+    elseif("Qt5::Widgets" IN_LIST SUNSHINE_TRAY_LINK_LIBRARIES)
         set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
                     ${CPACK_DEBIAN_PACKAGE_DEPENDS}, \
                     libqt5widgets5, \
@@ -181,6 +184,8 @@ if(${SUNSHINE_TRAY} STREQUAL 1)
                 x11-toolkits/qt5-widgets
                 graphics/qt5-svg
         )
+    else()
+        message(FATAL_ERROR "Cannot determine the Qt major version used by the tray target")
     endif()
 endif()
 

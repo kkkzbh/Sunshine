@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+guarded_run="/home/kkkzbh/.agents/skills/guarded-heavy-run/scripts/guarded-run.sh"
+cuda_root="${SUNSHINE_CUDA_ROOT:-/usr/local/cuda-13.3}"
+build_jobs="${SUNSHINE_BUILD_JOBS:-8}"
+build_dir="${SUNSHINE_BUILD_DIR:-}"
+
+usage() {
+  printf 'Usage: %s VERSION\n' "$0" >&2
+}
+
+if (($# != 1)) || [[ ! $1 =~ ^[0-9]{4}\.[0-9]{3}\.[0-9]+$ ]]; then
+  usage
+  exit 2
+fi
+version=$1
+tag="v${version}"
+
+for command_name in cmake cpack gcc-15 g++-15 git jq ninja npm rpm; do
+  command -v "$command_name" >/dev/null
+done
+[[ -x $guarded_run ]]
+[[ -x $cuda_root/bin/nvcc ]]
+[[ $(git -C "$source_dir" status --porcelain --untracked-files=normal) == "" ]]
+head_commit=$(git -C "$source_dir" rev-parse HEAD)
+tag_commit=$(git -C "$source_dir" rev-parse "refs/tags/${tag}^{commit}")
+[[ $head_commit == "$tag_commit" ]]
+
+if [[ -z $build_dir ]]; then
+  build_dir="/var/tmp/cmake-build-sunshine-${version}"
+fi
+case "$build_dir" in
+  /var/tmp/cmake-build-sunshine-*) ;;
+  *)
+    printf 'SUNSHINE_BUILD_DIR must be a dedicated /var/tmp/cmake-build-sunshine-* path\n' >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$build_dir"
+
+git -C "$source_dir" submodule update --init
+git -C "$source_dir/third-party/lizardbyte-common" \
+  submodule update --init third-party/googletest
+git -C "$source_dir/third-party/moonlight-common-c" \
+  submodule update --init enet nanors
+git -C "$source_dir/third-party/libdisplaydevice" \
+  submodule update --init third-party/lizardbyte-common
+git -C "$source_dir/third-party/tray" \
+  submodule update --init third-party/lizardbyte-common
+
+branch=$(git -C "$source_dir" branch --show-current)
+if [[ -z $branch ]]; then
+  branch=$tag
+fi
+
+env \
+  CC=/usr/bin/gcc-15 \
+  CXX=/usr/bin/g++-15 \
+  BUILD_VERSION="$tag" \
+  BRANCH="$branch" \
+  COMMIT="${head_commit:0:8}" \
+  cmake \
+    -S "$source_dir" \
+    -B "$build_dir" \
+    -G Ninja \
+    -DBUILD_DOCS=OFF \
+    -DBUILD_TESTS=ON \
+    -DBUILD_WERROR=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DSUNSHINE_ASSETS_DIR=share/sunshine \
+    -DSUNSHINE_EXECUTABLE_PATH=/usr/bin/sunshine \
+    -DSUNSHINE_ENABLE_CUDA=ON \
+    -DCUDA_FAIL_ON_MISSING=ON \
+    -DCMAKE_CUDA_COMPILER="$cuda_root/bin/nvcc" \
+    -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-15 \
+    -DSUNSHINE_ENABLE_VULKAN=ON \
+    -DSUNSHINE_SYSTEM_VULKAN_HEADERS=ON \
+    -DSUNSHINE_ENABLE_DRM=ON \
+    -DSUNSHINE_ENABLE_KWIN=ON \
+    -DSUNSHINE_ENABLE_PORTAL=ON \
+    -DSUNSHINE_ENABLE_WAYLAND=ON \
+    -DSUNSHINE_ENABLE_X11=ON \
+    -DSUNSHINE_PUBLISHER_NAME=kkkzbh \
+    -DSUNSHINE_PUBLISHER_WEBSITE=https://github.com/kkkzbh/Sunshine \
+    -DSUNSHINE_PUBLISHER_ISSUE_URL=https://github.com/kkkzbh/Sunshine/issues
+
+"$guarded_run" \
+  --jobs "$build_jobs" \
+  --mem-high 20G \
+  --mem-max 22G \
+  --swap-max 2G \
+  --min-available 5G \
+  --cmake-build "$build_dir" \
+  --target test_sunshine sunshine
+
+"$build_dir/tests/test_sunshine" \
+  --gtest_filter='LinuxInputCapabilitiesTest.*'
+
+"$guarded_run" \
+  --jobs "$build_jobs" \
+  --mem-high 20G \
+  --mem-max 22G \
+  --swap-max 2G \
+  --min-available 5G \
+  --cmake-build "$build_dir" \
+  --target package
+
+package_dir="$build_dir/cpack-fedora"
+cpack --config "$build_dir/CPackConfig.cmake" -G RPM -B "$package_dir"
+source_rpm="$package_dir/Sunshine.rpm"
+artifact="$source_dir/artifacts/$version/Sunshine-${version}-1.kkkzbh.x86_64.rpm"
+[[ -f $source_rpm ]]
+install -Dm644 "$source_rpm" "$artifact"
+
+[[ $(rpm -qp --qf '%{NAME}\n' "$artifact") == Sunshine ]]
+[[ $(rpm -qp --qf '%{VERSION}\n' "$artifact") == "$version" ]]
+[[ $(rpm -qp --qf '%{RELEASE}\n' "$artifact") == 1.kkkzbh ]]
+[[ $(rpm -qp --qf '%{VENDOR}\n' "$artifact") == kkkzbh ]]
+[[ $(rpm -qp --qf '%{URL}\n' "$artifact") == https://github.com/kkkzbh/Sunshine ]]
+rpm -qp --requires "$artifact" | grep -Fx qt6-qtbase >/dev/null
+rpm -qp --requires "$artifact" | grep -Fx qt6-qtsvg >/dev/null
+if rpm -qp --requires "$artifact" | grep -Eq '^qt5-'; then
+  printf 'RPM unexpectedly depends on Qt 5\n' >&2
+  exit 1
+fi
+
+printf '%s\n' "$artifact"
