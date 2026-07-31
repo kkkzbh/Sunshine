@@ -23,13 +23,21 @@ namespace platf {
 
   /**
    * @brief Create the platform input backend for a stream.
+   *
+   * @return Owning handle for the platform input backend.
    */
   input_t input() {
     return {new input_raw_t()};
   }
 
+  /**
+   * @brief Allocate per-client input devices allowed by the native input configuration.
+   *
+   * @param input Platform input backend shared by the client context.
+   * @return Per-client input context.
+   */
   std::unique_ptr<client_input_t> allocate_client_input_context(input_t &input) {
-    return std::make_unique<client_input_raw_t>(input);
+    return std::make_unique<client_input_raw_t>(input, config::input.native_pen_touch);
   }
 
   /**
@@ -139,10 +147,17 @@ namespace platf {
     platf::gamepad::battery(raw, battery);
   }
 
+  /**
+   * @brief Return platform input capabilities enabled by the active configuration.
+   *
+   * @return Capability flags advertised to streaming clients.
+   */
   platform_caps::caps_t get_capabilities() {
     platform_caps::caps_t caps = 0;
     // TODO: if has_uinput
-    caps |= platform_caps::pen_touch;
+    if (config::input.native_pen_touch) {
+      caps |= platform_caps::pen_touch;
+    }
 
     // We support controller touchpad input only when emulating the PS5 controller
     if (config::input.gamepad == "ds5"sv || config::input.gamepad == "auto"sv) {

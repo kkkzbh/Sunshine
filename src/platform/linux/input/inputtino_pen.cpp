@@ -24,9 +24,9 @@ namespace platf::pen {
   void update(client_input_raw_t *raw, const touch_port_t &touch_port, const pen_input_t &pen) {
     if (raw->pen) {
       // First set the buttons
-      (*raw->pen).set_btn(inputtino::PenTablet::PRIMARY, pen.penButtons & LI_PEN_BUTTON_PRIMARY);
-      (*raw->pen).set_btn(inputtino::PenTablet::SECONDARY, pen.penButtons & LI_PEN_BUTTON_SECONDARY);
-      (*raw->pen).set_btn(inputtino::PenTablet::TERTIARY, pen.penButtons & LI_PEN_BUTTON_TERTIARY);
+      raw->pen->set_btn(inputtino::PenTablet::PRIMARY, pen.penButtons & LI_PEN_BUTTON_PRIMARY);
+      raw->pen->set_btn(inputtino::PenTablet::SECONDARY, pen.penButtons & LI_PEN_BUTTON_SECONDARY);
+      raw->pen->set_btn(inputtino::PenTablet::TERTIARY, pen.penButtons & LI_PEN_BUTTON_TERTIARY);
 
       // Set the tool
       inputtino::PenTablet::TOOL_TYPE tool;
@@ -66,7 +66,7 @@ namespace platf::pen {
 
       bool is_touching = pen.eventType == LI_TOUCH_EVENT_DOWN || pen.eventType == LI_TOUCH_EVENT_MOVE;
 
-      (*raw->pen).place_tool(tool, pen.x, pen.y, is_touching ? pen.pressureOrDistance : -1, is_touching ? -1 : pen.pressureOrDistance, tilt_x, tilt_y);
+      raw->pen->place_tool(tool, pen.x, pen.y, is_touching ? pen.pressureOrDistance : -1, is_touching ? -1 : pen.pressureOrDistance, tilt_x, tilt_y);
     }
   }
 }  // namespace platf::pen

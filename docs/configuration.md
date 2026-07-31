@@ -672,6 +672,9 @@ editing the `conf` file in a text editor. Use the examples as reference.
             When enabled, Sunshine will pass through native pen/touch events from Moonlight clients.
             <br>
             This can be useful to disable for older applications without native pen/touch support.
+            On Linux and Windows, disabling this setting removes the native pen/touch capability
+            from the protocol handshake, so clients use mouse-compatible input. The Linux backend
+            also omits its per-client touch-screen and pen-tablet devices while this setting is disabled.
         </td>
     </tr>
     <tr>

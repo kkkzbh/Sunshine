@@ -8,6 +8,7 @@
 #include <boost/locale.hpp>
 #include <inputtino/input.hpp>
 #include <libevdev/libevdev.h>
+#include <optional>
 
 // local includes
 #include "src/config.h"
@@ -102,26 +103,37 @@ namespace platf {
      * @brief Create per-client inputtino devices for touch and pen input.
      *
      * @param input Platform input backend that receives the event.
+     * @param native_pen_touch_enabled Whether native touch and pen devices are enabled.
      */
-    client_input_raw_t(input_t &input):
-        touch(inputtino::TouchScreen::create({
-          .name = inputtino_name_for_seat("Touch passthrough"sv),
-          .vendor_id = 0xBEEF,
-          .product_id = 0xDEAD,
-          .version = 0x111,
-        })),
-        pen(inputtino::PenTablet::create({
-          .name = inputtino_name_for_seat("Pen passthrough"sv),
-          .vendor_id = 0xBEEF,
-          .product_id = 0xDEAD,
-          .version = 0x111,
-        })) {
+    client_input_raw_t(input_t &input, bool native_pen_touch_enabled) {
       global = (input_raw_t *) input.get();
-      if (!touch) {
-        BOOST_LOG(warning) << "Unable to create virtual touch screen: " << touch.getErrorMessage();
+
+      if (!native_pen_touch_enabled) {
+        return;
       }
-      if (!pen) {
-        BOOST_LOG(warning) << "Unable to create virtual pen tablet: " << pen.getErrorMessage();
+
+      auto touch_result = inputtino::TouchScreen::create({
+        .name = inputtino_name_for_seat("Touch passthrough"sv),
+        .vendor_id = 0xBEEF,
+        .product_id = 0xDEAD,
+        .version = 0x111,
+      });
+      if (touch_result) {
+        touch.emplace(std::move(*touch_result));
+      } else {
+        BOOST_LOG(warning) << "Unable to create virtual touch screen: " << touch_result.getErrorMessage();
+      }
+
+      auto pen_result = inputtino::PenTablet::create({
+        .name = inputtino_name_for_seat("Pen passthrough"sv),
+        .vendor_id = 0xBEEF,
+        .product_id = 0xDEAD,
+        .version = 0x111,
+      });
+      if (pen_result) {
+        pen.emplace(std::move(*pen_result));
+      } else {
+        BOOST_LOG(warning) << "Unable to create virtual pen tablet: " << pen_result.getErrorMessage();
       }
     }
 
@@ -131,8 +143,8 @@ namespace platf {
     // input context, because each connected client may be sending their own independent
     // pen/touch events. To maintain separation, we expose separate pen and touch devices
     // for each client.
-    inputtino::Result<inputtino::TouchScreen> touch;  ///< Per-client virtual touchscreen device.
-    inputtino::Result<inputtino::PenTablet> pen;  ///< Per-client virtual pen tablet device.
+    std::optional<inputtino::TouchScreen> touch;  ///< Per-client virtual touchscreen device.
+    std::optional<inputtino::PenTablet> pen;  ///< Per-client virtual pen tablet device.
   };
 
   /**

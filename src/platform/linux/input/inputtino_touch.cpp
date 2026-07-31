@@ -42,14 +42,14 @@ namespace platf::touch {
             } else if (adjusted_angle < -90) {
               adjusted_angle += 360;
             }
-            (*raw->touch).place_finger(touch.pointerId, touch.x, touch.y, touch.pressureOrDistance, adjusted_angle);
+            raw->touch->place_finger(touch.pointerId, touch.x, touch.y, touch.pressureOrDistance, adjusted_angle);
             break;
           }
         case LI_TOUCH_EVENT_CANCEL:
         case LI_TOUCH_EVENT_UP:
         case LI_TOUCH_EVENT_HOVER_LEAVE:
           {
-            (*raw->touch).release_finger(touch.pointerId);
+            raw->touch->release_finger(touch.pointerId);
             break;
           }
           // TODO: LI_TOUCH_EVENT_CANCEL_ALL
