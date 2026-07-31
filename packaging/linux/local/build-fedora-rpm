@@ -97,8 +97,10 @@ env \
   --target test_sunshine \
   --target sunshine
 
-"$build_dir/tests/test_sunshine" \
-  --gtest_filter='LinuxInputCapabilitiesTest.*'
+(
+  cd -- "$build_dir"
+  ./tests/test_sunshine --gtest_filter='LinuxInputCapabilitiesTest.*'
+)
 
 "$guarded_run" \
   --jobs "$build_jobs" \
