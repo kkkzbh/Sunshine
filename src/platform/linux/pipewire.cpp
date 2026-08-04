@@ -3,8 +3,6 @@
  * @brief Shared classes for pipewire-based capture methods.
  */
 // standard includes
-#include <fstream>
-
 // lib includes
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -17,6 +15,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "pipewire_host_buffer.h"
 #include "src/main.h"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -101,17 +100,8 @@ namespace pipewire {
     std::condition_variable frame_cv;  ///< Signals arrival or release of a PipeWire frame.
     size_t local_stride = 0;  ///< Local stride.
     bool frame_ready = false;  ///< Whether a PipeWire frame is ready to consume.
-    // Two distinct memory pools
-    std::vector<uint8_t> buffer_a;  ///< First staging buffer used for CPU-copy PipeWire frames.
-    std::vector<uint8_t> buffer_b;  ///< Second staging buffer used for CPU-copy PipeWire frames.
-    // Points to the buffer currently owned by fill_img
-    std::vector<uint8_t> *front_buffer;  ///< Staging buffer currently readable by `fill_img`.
-    // Points to the buffer currently being written by on_process
-    std::vector<uint8_t> *back_buffer;  ///< Staging buffer currently writable by PipeWire callbacks.
-
-    stream_data_t():
-        front_buffer(&buffer_a),
-        back_buffer(&buffer_b) {}
+    host_buffer_ptr front_buffer {std::make_shared<host_buffer_t>()};  ///< Frame currently readable by `fill_img`.
+    host_buffer_ptr back_buffer {std::make_shared<host_buffer_t>()};  ///< Recyclable storage for the next PipeWire frame.
   };
 
   /**
@@ -127,12 +117,23 @@ namespace pipewire {
    * @brief Pipewire image assembled for encoding.
    */
   struct img_descriptor_t: public egl::img_descriptor_t {
+    /**
+     * @brief Release DMA-BUF descriptors and host-frame ownership.
+     */
     ~img_descriptor_t() override {
-      if (data) {
-        delete[] data;
-        data = nullptr;
-      }
+      reset();
     }
+
+    /**
+     * @brief Reset the descriptor before binding another captured frame.
+     */
+    void reset() {
+      egl::img_descriptor_t::reset();
+      host_buffer.reset();
+      data = nullptr;
+    }
+
+    host_buffer_ptr host_buffer;  ///< Keeps host-visible pixels alive through encoding.
   };
 
   /**
@@ -276,10 +277,10 @@ namespace pipewire {
      * @param refresh_rate Refresh rate.
      * @param dmabuf_infos Dmabuf infos.
      * @param n_dmabuf_infos N dmabuf infos.
-     * @param display_is_nvidia Display is nvidia.
+     * @param capture_is_nvidia Whether the capture GPU supports direct CUDA DMA-BUF import.
      * @return 0 when the PipeWire stream is configured; nonzero on negotiation failure.
      */
-    int ensure_stream(const platf::mem_type_e mem_type, const uint32_t width, const uint32_t height, const uint32_t refresh_rate, const struct dmabuf_format_info_t *dmabuf_infos, const int n_dmabuf_infos, const bool display_is_nvidia) {
+    int ensure_stream(const platf::mem_type_e mem_type, const uint32_t width, const uint32_t height, const uint32_t refresh_rate, const struct dmabuf_format_info_t *dmabuf_infos, const int n_dmabuf_infos, const bool capture_is_nvidia) {
       pw_thread_loop_lock(loop);
       int result = 0;
       if (!stream_data.stream) {
@@ -307,7 +308,7 @@ namespace pipewire {
         // be imported into CUDA, so we fall back to memory buffers in that case.
         bool use_dmabuf = n_dmabuf_infos > 0 && (mem_type == platf::mem_type_e::vaapi ||
                                                  mem_type == platf::mem_type_e::vulkan ||
-                                                 (mem_type == platf::mem_type_e::cuda && display_is_nvidia));
+                                                 (mem_type == platf::mem_type_e::cuda && capture_is_nvidia));
         if (use_dmabuf) {
           for (int i = 0; i < n_dmabuf_infos; i++) {
             auto format_param = build_format_parameter(&pod_builder, width, height, refresh_rate, dmabuf_infos[i].format, dmabuf_infos[i].modifiers, dmabuf_infos[i].n_modifiers);
@@ -430,12 +431,13 @@ namespace pipewire {
 
       struct spa_buffer *buf = stream_data.current_buffer->buffer;
       if (buf->datas[0].chunk->size != 0) {
-        auto *img_descriptor = static_cast<egl::img_descriptor_t *>(img);
+        auto *img_descriptor = static_cast<img_descriptor_t *>(img);
         fill_img_metadata(img_descriptor, buf);
         if (buf->datas[0].type == SPA_DATA_DmaBuf) {
           fill_img_dmabuf(img_descriptor, buf, stream_data);
         } else {
-          img->data = stream_data.front_buffer->data();
+          img_descriptor->host_buffer = stream_data.front_buffer;
+          img->data = img_descriptor->host_buffer->data();
           img->row_pitch = stream_data.local_stride;
         }
       }
@@ -594,13 +596,15 @@ namespace pipewire {
       }
       // 3. Optimized Path: Software/MemPtr
       else if (b->buffer->datas[0].data != nullptr) {
-        size_t size = b->buffer->datas[0].chunk->size;
+        auto size = b->buffer->datas[0].chunk->size;
+        auto source = std::span {
+          static_cast<const std::uint8_t *>(b->buffer->datas[0].data),
+          static_cast<std::size_t>(size)
+        };
 
-        // Perform the copy to the BACK buffer while NOT holding the lock
-        if (d->back_buffer->size() < size) {
-          d->back_buffer->resize(size);
-        }
-        std::memcpy(d->back_buffer->data(), b->buffer->datas[0].data, size);
+        // Copy outside the lock. write_host_buffer allocates when an encoder
+        // still owns the recyclable buffer.
+        d->back_buffer = write_host_buffer(std::move(d->back_buffer), source);
 
         {
           // Lock only for the pointer swap and state update
@@ -844,7 +848,7 @@ namespace pipewire {
       }
 
       // Start PipeWire now so format negotiation can proceed before capture start
-      if (pipewire.ensure_stream(mem_type, width, height, framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia) < 0) {
+      if (pipewire.ensure_stream(mem_type, width, height, framerate, dmabuf_infos.data(), n_dmabuf_infos, capture_is_nvidia) < 0) {
         BOOST_LOG(error) << "[pipewire] Failed to ensure pipewire stream. pipewire_t::init() failed.";
         return -1;
       }
@@ -904,7 +908,7 @@ namespace pipewire {
           return platf::capture_e::interrupted;
         }
 
-        auto *img_egl = static_cast<egl::img_descriptor_t *>(img_out.get());
+        auto *img_egl = static_cast<img_descriptor_t *>(img_out.get());
         img_egl->reset();
         pipewire.fill_img(img_egl);
 
@@ -955,7 +959,7 @@ namespace pipewire {
     platf::capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       auto next_frame = std::chrono::steady_clock::now();
 
-      if (pipewire.ensure_stream(mem_type, width, height, framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia) < 0) {
+      if (pipewire.ensure_stream(mem_type, width, height, framerate, dmabuf_infos.data(), n_dmabuf_infos, capture_is_nvidia) < 0) {
         BOOST_LOG(error) << "[pipewire] Failed to ensure pipewire stream. capture() failed with error.";
         return platf::capture_e::error;
       }
@@ -1040,7 +1044,7 @@ namespace pipewire {
 
 #ifdef SUNSHINE_BUILD_CUDA
       if (mem_type == platf::mem_type_e::cuda) {
-        if (display_is_nvidia && n_dmabuf_infos > 0) {
+        if (capture_is_nvidia && n_dmabuf_infos > 0) {
           // Display GPU is NVIDIA - can use DMA-BUF directly
           return cuda::make_avcodec_gl_encode_device(width, height, 0, 0);
         } else {
@@ -1061,7 +1065,11 @@ namespace pipewire {
      * @return Capture status reported to the streaming pipeline.
      */
     int dummy_img(platf::img_t *img) override {
-      // Empty images are recognized as dummies by the zero sequence number
+      auto *descriptor = static_cast<img_descriptor_t *>(img);
+      descriptor->host_buffer = make_zeroed_host_buffer(
+        static_cast<std::size_t>(img->height) * img->row_pitch
+      );
+      img->data = descriptor->host_buffer->data();
       return 0;
     }
 
@@ -1209,36 +1217,11 @@ namespace pipewire {
         return -1;
       }
 
-      // Detect if this is a pure NVIDIA system (not hybrid Intel+NVIDIA)
-      // On hybrid systems, the wayland compositor typically runs on Intel,
-      // so DMA-BUFs from portal will come from Intel and cannot be imported into CUDA.
-      // Check if Intel GPU exists - if so, assume hybrid system and disable CUDA DMA-BUF.
-      bool has_intel_gpu = std::ifstream("/sys/class/drm/card0/device/vendor").good() ||
-                           std::ifstream("/sys/class/drm/card1/device/vendor").good();
-      if (has_intel_gpu) {
-        // Read vendor IDs to check for Intel (0x8086)
-        auto check_intel = [](const std::string &path) {
-          if (std::ifstream f(path); f.good()) {
-            std::string vendor;
-            f >> vendor;
-            return vendor == "0x8086";
-          }
-          return false;
-        };
-        bool intel_present = check_intel("/sys/class/drm/card0/device/vendor") ||
-                             check_intel("/sys/class/drm/card1/device/vendor");
-        if (intel_present) {
-          BOOST_LOG(info) << "[pipewire] Hybrid GPU system detected (Intel + discrete) - CUDA will use memory buffers"sv;
-          display_is_nvidia = false;
-        } else {
-          // No Intel GPU found, check if NVIDIA is present
-          const char *vendor = eglQueryString(egl_display.get(), EGL_VENDOR);
-          if (vendor && std::string_view(vendor).contains("NVIDIA")) {
-            BOOST_LOG(info) << "[pipewire] Pure NVIDIA system - DMA-BUF will be enabled for CUDA"sv;
-            display_is_nvidia = true;
-          }
-        }
-      }
+      auto vendor = eglQueryString(egl_display.get(), EGL_VENDOR);
+      capture_is_nvidia = vendor && std::string_view(vendor).contains("NVIDIA");
+      BOOST_LOG(info) << "[pipewire] Capture EGL vendor: "sv << (vendor ? vendor : "unknown");
+      BOOST_LOG(info) << "[pipewire] CUDA transport: "sv
+                      << (capture_is_nvidia ? "DMA-BUF"sv : "host memory"sv);
 
       if (eglQueryDmaBufFormatsEXT && eglQueryDmaBufModifiersEXT) {
         query_dmabuf_formats(egl_display.get());
@@ -1251,7 +1234,7 @@ namespace pipewire {
     wl::display_t wl_display;
     std::array<struct dmabuf_format_info_t, MAX_DMABUF_FORMATS> dmabuf_infos;
     int n_dmabuf_infos;
-    bool display_is_nvidia = false;  // Track if display GPU is NVIDIA
+    bool capture_is_nvidia = false;  ///< Whether capture buffers can be imported directly into CUDA.
     std::chrono::nanoseconds delay;
     std::optional<std::uint64_t> last_pts {};
     std::optional<std::uint64_t> last_seq {};
