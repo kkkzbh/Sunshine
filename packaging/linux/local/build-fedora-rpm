@@ -4,7 +4,7 @@ set -euo pipefail
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 guarded_run="/home/kkkzbh/.agents/skills/guarded-heavy-run/scripts/guarded-run.sh"
 cuda_root="${SUNSHINE_CUDA_ROOT:-/usr/local/cuda-13.3}"
-build_jobs="${SUNSHINE_BUILD_JOBS:-8}"
+build_jobs="${SUNSHINE_BUILD_JOBS:-1}"
 build_dir="${SUNSHINE_BUILD_DIR:-}"
 
 usage() {
@@ -89,25 +89,25 @@ env \
 
 "$guarded_run" \
   --jobs "$build_jobs" \
-  --mem-high 20G \
-  --mem-max 22G \
-  --swap-max 2G \
-  --min-available 5G \
+  --mem-high 16G \
+  --mem-max 18G \
+  --swap-max 1G \
+  --min-available 3G \
   --cmake-build "$build_dir" \
   --target test_sunshine \
   --target sunshine
 
 (
   cd -- "$build_dir"
-  ./tests/test_sunshine --gtest_filter='LinuxInputCapabilitiesTest.*'
+  ./tests/test_sunshine --gtest_filter='LinuxInputCapabilitiesTest.*:InputModifierTest.*'
 )
 
 "$guarded_run" \
   --jobs "$build_jobs" \
-  --mem-high 20G \
-  --mem-max 22G \
-  --swap-max 2G \
-  --min-available 5G \
+  --mem-high 16G \
+  --mem-max 18G \
+  --swap-max 1G \
+  --min-available 3G \
   --cmake-build "$build_dir" \
   --target package
 

@@ -15,6 +15,7 @@ extern "C" {
 #include <list>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 // lib includes
 #include <boost/endian/buffers.hpp>
@@ -153,10 +154,6 @@ namespace input {
     return std::clamp(from_netfloat(f), min, max);
   }
 
-  static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
-  static std::unordered_map<key_press_id_t, bool> key_press {};
-  static std::array<std::uint8_t, 5> mouse_press {};
-
   static platf::input_t platf_input;
   static std::bitset<platf::MAX_GAMEPADS> gamepadMask {};
 
@@ -235,6 +232,7 @@ namespace input {
         client_context {platf::allocate_client_input_context(platf_input)},
         touch_port_event {std::move(touch_port_event)},
         feedback_queue {std::move(feedback_queue)},
+        key_press_repeat_id {},
         mouse_left_button_timeout {},
         touch_port {{0, 0, 0, 0}, 0, 0, 1.0f, 1.0f, 0, 0},
         accumulated_vscroll_delta {},
@@ -256,12 +254,19 @@ namespace input {
     std::list<std::vector<uint8_t>> input_queue;  ///< Pending raw input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
 
+    task_pool_util::TaskPool::task_id_t key_press_repeat_id;  ///< Repeat task owned by this stream.
+    std::unordered_map<key_press_id_t, bool> key_press;  ///< Pressed keyboard keys owned by this stream.
+    std::array<std::uint8_t, 5> mouse_press {};  ///< Pressed mouse buttons owned by this stream.
+    std::uint8_t reconciled_modifiers {};  ///< Modifier bits synthesized from packet masks.
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;  ///< Mouse left button timeout.
 
     input::touch_port_t touch_port;  ///< Touch coordinate bounds for the current stream.
 
     int32_t accumulated_vscroll_delta;  ///< Accumulated vscroll delta.
     int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
+    std::uint64_t relative_mouse_packets {};  ///< Relative mouse packets received in this stream.
+    std::int64_t relative_mouse_delta_x {};  ///< Accumulated relative horizontal movement.
+    std::int64_t relative_mouse_delta_y {};  ///< Accumulated relative vertical movement.
   };
 
   /**
@@ -564,8 +569,16 @@ namespace input {
       return;
     }
 
+    auto delta_x = util::endian::big(packet->deltaX);
+    auto delta_y = util::endian::big(packet->deltaY);
     input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
-    platf::move_mouse(platf_input, util::endian::big(packet->deltaX), util::endian::big(packet->deltaY));
+    ++input->relative_mouse_packets;
+    input->relative_mouse_delta_x += delta_x;
+    input->relative_mouse_delta_y += delta_y;
+    if (input->relative_mouse_packets == 1) {
+      BOOST_LOG(debug) << "Input telemetry: relative mouse active delta=["sv << delta_x << ',' << delta_y << ']';
+    }
+    platf::move_mouse(platf_input, delta_x, delta_y);
   }
 
   /**
@@ -725,13 +738,13 @@ namespace input {
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
-    if (button > 0 && button < mouse_press.size()) {
-      if (mouse_press[button] != release) {
+    if (button > 0 && button < input->mouse_press.size()) {
+      if (input->mouse_press[button] != release) {
         // button state is already what we want
         return;
       }
 
-      mouse_press[button] = !release;
+      input->mouse_press[button] = !release;
     }
     /**
      * When Moonlight sends mouse input through absolute coordinates,
@@ -748,15 +761,15 @@ namespace input {
      * when the last mouse coordinates were absolute
      */
     if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
-      auto f = [=]() {
-        auto left_released = mouse_press[BUTTON_LEFT];
+      auto f = [input, release]() {
+        auto left_released = input->mouse_press[BUTTON_LEFT];
         if (left_released) {
           // Already released left button
           return;
         }
         platf::button_mouse(platf_input, BUTTON_LEFT, release);
 
-        mouse_press[BUTTON_LEFT] = false;
+        input->mouse_press[BUTTON_LEFT] = false;
         input->mouse_left_button_timeout = nullptr;
       };
 
@@ -771,7 +784,7 @@ namespace input {
       platf::button_mouse(platf_input, BUTTON_RIGHT, false);
       platf::button_mouse(platf_input, BUTTON_RIGHT, true);
 
-      mouse_press[BUTTON_RIGHT] = false;
+      input->mouse_press[BUTTON_RIGHT] = false;
 
       return;
     }
@@ -795,122 +808,159 @@ namespace input {
   }
 
   /**
-   * @brief Update flags for keyboard shortcut combo's
+   * @brief Return the client modifier bit represented by a virtual key.
    *
-   * @param flags Bit flags that modify the requested operation.
-   * @param keyCode Moonlight keyboard packet key code.
-   * @param release Whether the key or button event is a release.
+   * @param key_code Platform virtual key code.
+   * @return One protocol modifier bit, or zero for a non-modifier key.
    */
-  inline void update_shortcutFlags(int *flags, short keyCode, bool release) {
-    switch (keyCode) {
+  auto modifier_for_key(std::uint16_t key_code) -> std::uint8_t {
+    switch (key_code) {
       case VKEY_SHIFT:
       case VKEY_LSHIFT:
       case VKEY_RSHIFT:
-        if (release) {
-          *flags &= ~input_t::SHIFT;
-        } else {
-          *flags |= input_t::SHIFT;
-        }
-        break;
+        return MODIFIER_SHIFT;
       case VKEY_CONTROL:
       case VKEY_LCONTROL:
       case VKEY_RCONTROL:
-        if (release) {
-          *flags &= ~input_t::CTRL;
-        } else {
-          *flags |= input_t::CTRL;
-        }
-        break;
+        return MODIFIER_CTRL;
       case VKEY_MENU:
       case VKEY_LMENU:
       case VKEY_RMENU:
-        if (release) {
-          *flags &= ~input_t::ALT;
-        } else {
-          *flags |= input_t::ALT;
-        }
-        break;
-    }
-  }
-
-  /**
-   * @brief Check whether modifier.
-   *
-   * @param keyCode Moonlight keyboard packet key code.
-   * @return True when the key code is a keyboard modifier.
-   */
-  bool is_modifier(uint16_t keyCode) {
-    switch (keyCode) {
-      case VKEY_SHIFT:
-      case VKEY_LSHIFT:
-      case VKEY_RSHIFT:
-      case VKEY_CONTROL:
-      case VKEY_LCONTROL:
-      case VKEY_RCONTROL:
-      case VKEY_MENU:
-      case VKEY_LMENU:
-      case VKEY_RMENU:
-        return true;
+        return MODIFIER_ALT;
       default:
-        return false;
+        return 0;
     }
   }
 
   /**
-   * @brief Send key and modifiers.
+   * @brief Return the generic platform key used for a client modifier bit.
    *
-   * @param key_code Moonlight keyboard packet key code.
-   * @param release Whether the key or button event is a release.
-   * @param flags Bit flags that modify the requested operation.
-   * @param synthetic_modifiers Synthetic modifiers.
+   * @param modifier One protocol modifier bit.
+   * @return Generic virtual key for that modifier.
    */
-  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers) {
-    if (!release) {
-      // Press any synthetic modifiers required for this key
-      if (synthetic_modifiers & MODIFIER_SHIFT) {
-        platf::keyboard_update(platf_input, VKEY_SHIFT, false, flags);
-      }
-      if (synthetic_modifiers & MODIFIER_CTRL) {
-        platf::keyboard_update(platf_input, VKEY_CONTROL, false, flags);
-      }
-      if (synthetic_modifiers & MODIFIER_ALT) {
-        platf::keyboard_update(platf_input, VKEY_MENU, false, flags);
+  auto key_for_modifier(std::uint8_t modifier) -> std::uint16_t {
+    switch (modifier) {
+      case MODIFIER_SHIFT:
+        return VKEY_SHIFT;
+      case MODIFIER_CTRL:
+        return VKEY_CONTROL;
+      case MODIFIER_ALT:
+        return VKEY_MENU;
+      default:
+        std::unreachable();
+    }
+  }
+
+  auto modifier_delta(std::uint8_t current, std::uint8_t desired) -> modifier_delta_t {
+    auto constexpr supported = MODIFIER_SHIFT | MODIFIER_CTRL | MODIFIER_ALT;
+    current &= supported;
+    desired &= supported;
+    return {
+      .press = static_cast<std::uint8_t>(desired & ~current),
+      .release = static_cast<std::uint8_t>(current & ~desired),
+    };
+  }
+
+  /**
+   * @brief Convert the session's logical modifier state to protocol bits.
+   *
+   * @param input Stream input state.
+   * @return Protocol modifier bits currently reflected on the host.
+   */
+  auto current_modifier_mask(input_t const &input) -> std::uint8_t {
+    std::uint8_t result = input.reconciled_modifiers;
+    for (auto const &[key_press_id, pressed] : input.key_press) {
+      if (pressed) {
+        result |= modifier_for_key(vk_from_kpid(key_press_id));
       }
     }
+    return result;
+  }
 
-    platf::keyboard_update(platf_input, map_keycode(key_code), release, flags);
+  /**
+   * @brief Rebuild shortcut flags from the exact session-owned key state.
+   *
+   * @param input Stream input state to update.
+   */
+  auto update_shortcut_flags(input_t &input) -> void {
+    auto modifiers = current_modifier_mask(input);
+    input.shortcutFlags = 0;
+    if (modifiers & MODIFIER_SHIFT) {
+      input.shortcutFlags |= input_t::SHIFT;
+    }
+    if (modifiers & MODIFIER_CTRL) {
+      input.shortcutFlags |= input_t::CTRL;
+    }
+    if (modifiers & MODIFIER_ALT) {
+      input.shortcutFlags |= input_t::ALT;
+    }
+  }
 
-    if (!release) {
-      // Raise any synthetic modifier keys we pressed
-      if (synthetic_modifiers & MODIFIER_SHIFT) {
-        platf::keyboard_update(platf_input, VKEY_SHIFT, true, flags);
-      }
-      if (synthetic_modifiers & MODIFIER_CTRL) {
-        platf::keyboard_update(platf_input, VKEY_CONTROL, true, flags);
-      }
-      if (synthetic_modifiers & MODIFIER_ALT) {
-        platf::keyboard_update(platf_input, VKEY_MENU, true, flags);
+  /**
+   * @brief Release every session-owned representation of one modifier.
+   *
+   * @param input Stream input state.
+   * @param modifier Protocol modifier bit to release.
+   * @param flags Keyboard packet flags used for a reconciled generic key.
+   */
+  auto release_modifier(input_t &input, std::uint8_t modifier, std::uint8_t flags) -> void {
+    if (input.reconciled_modifiers & modifier) {
+      platf::keyboard_update(platf_input, key_for_modifier(modifier), true, flags);
+      input.reconciled_modifiers &= ~modifier;
+    }
+    for (auto &[key_press_id, pressed] : input.key_press) {
+      if (pressed && modifier_for_key(vk_from_kpid(key_press_id)) == modifier) {
+        platf::keyboard_update(platf_input, vk_from_kpid(key_press_id), true, flags_from_kpid(key_press_id));
+        pressed = false;
       }
     }
+    if (modifier == MODIFIER_ALT) {
+      input.left_alt_pressed = false;
+      input.right_alt_pressed = false;
+    }
+    update_shortcut_flags(input);
+  }
+
+  /**
+   * @brief Apply an authoritative modifier mask before a non-modifier key packet.
+   *
+   * @param input Stream input state.
+   * @param desired Desired client modifier mask.
+   * @param flags Keyboard packet flags.
+   */
+  auto reconcile_modifiers(input_t &input, std::uint8_t desired, std::uint8_t flags) -> void {
+    auto delta = modifier_delta(current_modifier_mask(input), desired);
+    for (auto modifier : {MODIFIER_SHIFT, MODIFIER_CTRL, MODIFIER_ALT}) {
+      if (delta.release & modifier) {
+        release_modifier(input, modifier, flags);
+      }
+    }
+    for (auto modifier : {MODIFIER_SHIFT, MODIFIER_CTRL, MODIFIER_ALT}) {
+      if (delta.press & modifier) {
+        platf::keyboard_update(platf_input, key_for_modifier(modifier), false, flags);
+        input.reconciled_modifiers |= modifier;
+      }
+    }
+    update_shortcut_flags(input);
   }
 
   /**
    * @brief Re-emit a held key until its repeat task is cancelled.
    *
+   * @param input Stream input state that owns the repeat task.
    * @param key_code Moonlight keyboard packet key code.
    * @param flags Bit flags that modify the requested operation.
-   * @param synthetic_modifiers Synthetic modifiers.
    */
-  void repeat_key(uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
+  auto repeat_key(std::shared_ptr<input_t> input, uint16_t key_code, uint8_t flags) -> void {
     // If key no longer pressed, stop repeating
-    if (!key_press[make_kpid(key_code, flags)]) {
-      key_press_repeat_id = nullptr;
+    if (!input->key_press[make_kpid(key_code, flags)]) {
+      input->key_press_repeat_id = nullptr;
       return;
     }
 
-    send_key_and_modifiers(key_code, false, flags, synthetic_modifiers);
+    platf::keyboard_update(platf_input, key_code, false, flags);
 
-    key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, key_code, flags, synthetic_modifiers).task_id;
+    input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, input, key_code, flags).task_id;
   }
 
   /**
@@ -925,50 +975,43 @@ namespace input {
     }
 
     auto release = util::endian::little(packet->header.magic) == KEY_UP_EVENT_MAGIC;
-    auto keyCode = packet->keyCode & 0x00FF;
+    auto key_code = packet->keyCode & 0x00FF;
 
-    if (keyCode == VKEY_LMENU) {
+    if (key_code == VKEY_LMENU) {
       input->left_alt_pressed = !release;
-    } else if (keyCode == VKEY_RMENU) {
+    } else if (key_code == VKEY_RMENU) {
       input->right_alt_pressed = !release;
     }
 
     // Right-alt maps to meta, so it must not also register as ALT
-    int modifiers = packet->modifiers;
+    std::uint8_t modifiers = packet->modifiers;
     if (config::input.key_rightalt_to_key_win && input->right_alt_pressed && !input->left_alt_pressed) {
       modifiers &= ~MODIFIER_ALT;
     }
 
-    // Set synthetic modifier flags if the keyboard packet is requesting modifier
-    // keys that are not current pressed.
-    uint8_t synthetic_modifiers = 0;
-    if (!release && !is_modifier(keyCode)) {
-      if (!(input->shortcutFlags & input_t::SHIFT) && (modifiers & MODIFIER_SHIFT)) {
-        synthetic_modifiers |= MODIFIER_SHIFT;
-      }
-      if (!(input->shortcutFlags & input_t::CTRL) && (modifiers & MODIFIER_CTRL)) {
-        synthetic_modifiers |= MODIFIER_CTRL;
-      }
-      if (!(input->shortcutFlags & input_t::ALT) && (modifiers & MODIFIER_ALT)) {
-        synthetic_modifiers |= MODIFIER_ALT;
-      }
+    auto mapped_key_code = static_cast<std::uint16_t>(map_keycode(key_code));
+    auto modifier = modifier_for_key(mapped_key_code);
+    if (!modifier) {
+      reconcile_modifiers(*input, modifiers, packet->flags);
+    } else if (input->reconciled_modifiers & modifier) {
+      release_modifier(*input, modifier, packet->flags);
     }
 
-    auto &pressed = key_press[make_kpid(keyCode, packet->flags)];
+    auto &pressed = input->key_press[make_kpid(mapped_key_code, packet->flags)];
     if (!pressed) {
       if (!release) {
         // A new key has been pressed down, we need to check for key combo's
         // If a key-combo has been pressed down, don't pass it through
-        if (input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(keyCode) > 0) {
+        if (input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(key_code) > 0) {
           return;
         }
 
-        if (key_press_repeat_id) {
-          task_pool.cancel(key_press_repeat_id);
+        if (input->key_press_repeat_id) {
+          task_pool.cancel(input->key_press_repeat_id);
         }
 
         if (config::input.key_repeat_delay.count() > 0) {
-          key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, keyCode, packet->flags, synthetic_modifiers).task_id;
+          input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, input, mapped_key_code, packet->flags).task_id;
         }
       } else {
         // Already released
@@ -981,9 +1024,8 @@ namespace input {
 
     pressed = !release;
 
-    send_key_and_modifiers(keyCode, release, packet->flags, synthetic_modifiers);
-
-    update_shortcutFlags(&input->shortcutFlags, map_keycode(keyCode), release);
+    platf::keyboard_update(platf_input, mapped_key_code, release, packet->flags);
+    update_shortcut_flags(*input);
   }
 
   /**
@@ -1825,27 +1867,41 @@ namespace input {
    * @brief Reset the object to its initial empty state.
    */
   void reset(std::shared_ptr<input_t> &input) {
-    task_pool.cancel(key_press_repeat_id);
+    task_pool.cancel(input->key_press_repeat_id);
     task_pool.cancel(input->mouse_left_button_timeout);
 
-    // Ensure input is synchronous, by using the task_pool
-    task_pool.push([]() {
-      for (int x = 0; x < mouse_press.size(); ++x) {
-        if (mouse_press[x]) {
-          platf::button_mouse(platf_input, x, true);
-          mouse_press[x] = false;
+    // Wait for the serialized platform releases before a new session can receive input.
+    auto neutral = task_pool.push([input]() {
+      for (std::size_t x = 0; x < input->mouse_press.size(); ++x) {
+        if (input->mouse_press[x]) {
+          platf::button_mouse(platf_input, static_cast<int>(x), true);
+          input->mouse_press[x] = false;
         }
       }
 
-      for (auto &kp : key_press) {
+      for (auto &kp : input->key_press) {
         if (!kp.second) {
           // already released
           continue;
         }
-        platf::keyboard_update(platf_input, vk_from_kpid(kp.first) & 0x00FF, true, flags_from_kpid(kp.first));
-        key_press[kp.first] = false;
+        platf::keyboard_update(platf_input, vk_from_kpid(kp.first), true, flags_from_kpid(kp.first));
+        kp.second = false;
       }
+      for (auto modifier : {MODIFIER_SHIFT, MODIFIER_CTRL, MODIFIER_ALT}) {
+        if (input->reconciled_modifiers & modifier) {
+          platf::keyboard_update(platf_input, key_for_modifier(modifier), true, 0);
+        }
+      }
+      input->reconciled_modifiers = 0;
+      input->shortcutFlags = 0;
+      input->left_alt_pressed = false;
+      input->right_alt_pressed = false;
+      input->key_press_repeat_id = nullptr;
+      input->mouse_left_button_timeout = nullptr;
+      BOOST_LOG(debug) << "Input telemetry: session reset relativePackets="sv << input->relative_mouse_packets
+                       << " relativeDelta=["sv << input->relative_mouse_delta_x << ',' << input->relative_mouse_delta_y << ']';
     });
+    neutral.get();
   }
 
   /**

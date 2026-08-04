@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <cstdint>
 #include <functional>
 
 // local includes
@@ -13,6 +14,23 @@
 
 namespace input {
   struct input_t;
+
+  /**
+   * @brief Modifier changes required to reconcile host state with one client packet.
+   */
+  struct modifier_delta_t {
+    std::uint8_t press;  ///< Client modifier bits that must be pressed.
+    std::uint8_t release;  ///< Client modifier bits that must be released.
+  };
+
+  /**
+   * @brief Compute the exact modifier transition required by an authoritative packet mask.
+   *
+   * @param current Current client modifier mask reflected on the host.
+   * @param desired Modifier mask carried by the incoming non-modifier packet.
+   * @return Modifier bits to press and release before forwarding the packet.
+   */
+  auto modifier_delta(std::uint8_t current, std::uint8_t desired) -> modifier_delta_t;
 
   /**
    * @brief Write a debug log representation of the input packet.
